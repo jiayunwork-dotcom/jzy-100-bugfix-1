@@ -193,3 +193,96 @@ test('原始文本输入走完整接口链路', async () => {
   assert.equal(res.statusCode, 200);
   assert.equal(res.json().keywords.length, 3);
 });
+
+// 复现请求：同一机构名两种切法，旧边键拼接会塌缩成一条边。
+const SPLIT_ORG_BODY = {
+  document: {
+    sentences: [
+      ['中国', '人民银行', '发布', '利率'],
+      ['中国人民', '银行', '发布', '公告'],
+    ],
+  },
+  windowSize: 2,
+};
+
+test('回归：机构名不同切法 —— 建图接口的每对共现词与边权和逐对手数一致', async () => {
+  const res = await post('/v1/graph', SPLIT_ORG_BODY);
+  assert.equal(res.statusCode, 200);
+  const body = res.json();
+  assert.equal(body.nodeCount, 7);
+  assert.equal(body.edgeCount, 6);
+  // 窗口 2 下每句 3 条相邻共现、每对仅出现一次 => 6 条边权重全为 1。
+  assert.deepEqual(
+    body.graph.edges.map((e: { source: string; target: string; weight: number }) => [e.source, e.target, e.weight]),
+    [
+      ['中国', '人民银行', 1],
+      ['中国人民', '银行', 1],
+      ['人民银行', '发布', 1],
+      ['公告', '发布', 1],
+      ['利率', '发布', 1],
+      ['发布', '银行', 1],
+    ],
+  );
+});
+
+test('回归：同一请求默认步数内收敛，所有分数有限，排序与同分字典序照旧', async () => {
+  const res = await post('/v1/keywords', SPLIT_ORG_BODY);
+  assert.equal(res.statusCode, 200);
+  const body = res.json();
+  assert.equal(body.converged, true);
+  assert.ok(body.iterations >= 1 && body.iterations <= 200);
+  assert.equal(body.keywords.length, 7);
+  for (const k of body.keywords) {
+    assert.equal(typeof k.score, 'number', `词 ${k.word} 的分数必须是数字`);
+    assert.ok(Number.isFinite(k.score), `词 ${k.word} 的分数必须有限`);
+  }
+  for (let i = 1; i < body.keywords.length; i += 1) {
+    assert.ok(body.keywords[i - 1].score >= body.keywords[i].score, '分数必须从高到低');
+  }
+  assert.deepEqual(
+    body.keywords.map((k: { word: string }) => k.word),
+    ['发布', '人民银行', '银行', '中国', '中国人民', '公告', '利率'],
+  );
+});
+
+test('预分词里带空格/连字符/斜杠的词按整体处理，共现关系照实入图', async () => {
+  const res = await post('/v1/graph', {
+    document: { sentences: [['new york', '/x-y/', 'new york']] },
+    windowSize: 3,
+  });
+  assert.equal(res.statusCode, 200);
+  const body = res.json();
+  assert.deepEqual(body.graph.nodes, ['/x-y/', 'new york']);
+  assert.deepEqual(
+    body.graph.edges.map((e: { source: string; target: string; weight: number }) => [e.source, e.target, e.weight]),
+    [['/x-y/', 'new york', 2]],
+  );
+  assert.deepEqual(body.tokenizedSentences, [['new york', '/x-y/', 'new york']]);
+});
+
+test('批量中混入该问题稿：它自己出正确结果，同批其它篇不受影响', async () => {
+  const res = await post('/v1/keywords/batch', {
+    documents: [
+      SPLIT_ORG_BODY,
+      { document: { sentences: [['苹果', '香蕉']] } },
+    ],
+  });
+  assert.equal(res.statusCode, 200);
+  const { results } = res.json();
+  assert.equal(results.length, 2);
+
+  assert.equal(results[0].ok, true);
+  assert.equal(results[0].result.converged, true);
+  assert.equal(results[0].result.nodeCount, 7);
+  assert.equal(results[0].result.edgeCount, 6);
+  for (const k of results[0].result.keywords) {
+    assert.ok(Number.isFinite(k.score));
+  }
+
+  assert.equal(results[1].ok, true);
+  assert.equal(results[1].result.nodeCount, 2);
+  assert.deepEqual(
+    results[1].result.keywords.map((k: { word: string }) => k.word),
+    ['苹果', '香蕉'],
+  );
+});

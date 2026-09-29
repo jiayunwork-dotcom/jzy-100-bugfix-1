@@ -16,6 +16,12 @@
  *   初始分数全部为 1。每轮取所有词新旧分数差的最大绝对值，
  *   当该值 < 收敛阈值时判定收敛；达到步数上限仍未收敛则抛 NOT_CONVERGED，
  *   绝不把未稳定的半成品分数当正常结果返回。
+ *
+ *   数值安全（钉死）：任何一个词的分数一旦变成 NaN 或 ±Infinity，
+ *   绝不能再标成收敛返回。注意 Math.abs(NaN) 与任何有限阈值比较都为 false，
+ *   若不显式拦截，发散后的 NaN 会让 maxDelta 恒为 0、从而被误判为“已收敛”，
+ *   再经 JSON 序列化成 null 流向下游。这里在迭代过程中与产出结果前各做一次
+ *   Number.isFinite 守卫，命中即按未收敛处理并拒绝返回分数。
  */
 import { AppError, ErrorCodes } from './errors';
 import type { CooccurrenceGraph } from './graph';
@@ -52,6 +58,17 @@ export function rankNodes(
         inbound += (weight / totalOutWeight[j]) * scores[j];
       }
       next[i] = 1 - damping + damping * inbound;
+
+      // 数值守卫：NaN/±Infinity 绝不允许继续迭代，更不允许被判成收敛。
+      // NaN 会让后面的 delta 比较全部为 false（maxDelta 恒为 0），
+      // 从而伪装成收敛，必须在这里就拦下。
+      if (!Number.isFinite(next[i])) {
+        throw new AppError(
+          ErrorCodes.NOT_CONVERGED,
+          `迭代到第 ${iter} 步时出现非有限分数（${String(next[i])}），拒绝返回被污染的分数`,
+        );
+      }
+
       const delta = Math.abs(next[i] - scores[i]);
       if (delta > maxDelta) {
         maxDelta = delta;
@@ -59,6 +76,15 @@ export function rankNodes(
     }
 
     scores = next;
+
+    // 双保险：显式校验本轮最大分差本身是有限数（NaN 与任何阈值比较都为 false）。
+    if (!Number.isFinite(maxDelta)) {
+      throw new AppError(
+        ErrorCodes.NOT_CONVERGED,
+        `迭代到第 ${iter} 步时分差出现非有限值（${String(maxDelta)}），拒绝返回被污染的分数`,
+      );
+    }
+
     if (maxDelta < tolerance) {
       converged = true;
       break;
@@ -74,6 +100,13 @@ export function rankNodes(
 
   const scoreMap = new Map<string, number>();
   for (let i = 0; i < n; i += 1) {
+    // 产出前最后一道防线：任何 NaN/±Infinity 都不得以“已收敛”的正常结果返回。
+    if (!Number.isFinite(scores[i])) {
+      throw new AppError(
+        ErrorCodes.NOT_CONVERGED,
+        `收敛后词「${nodes[i]}」的分数为非有限值（${String(scores[i])}），拒绝返回被污染的分数`,
+      );
+    }
     scoreMap.set(nodes[i], scores[i]);
   }
   return { scores: scoreMap, converged, iterations };

@@ -14,9 +14,19 @@
  */
 import type { CooccurrenceGraphData, GraphEdge, TokenSequence } from './types';
 
-/** 规范化无向边键：端点按字典序排列，保证 (a,b) 与 (b,a) 是同一条边。 */
-function edgeKey(a: string, b: string): string {
-  return a < b ? `${a}${b}` : `${b}${a}`;
+/**
+ * 规范化无向边键：用两个节点的【下标对】生成，而非拼接词面量。
+ *
+ * 不能用 `${a}${b}` 这类无分隔拼接：词面量可以是任意字符串（含空格、
+ * 连字符、斜杠等），拼接键会让不同的词对塌缩成同一条边，例如
+ * ("中国","人民银行") 与 ("中国人民","银行") 排序后拼接都是 "中国人民银行"。
+ * 任何字符分隔符都无法在任意字符串输入下保证无碰撞，而节点下标是建图时
+ * 分配的非负整数、一经分配永不改变；用逗号（十进制整数串里不可能出现的
+ * 字符）连接两个下标即可保证无碰撞，且与词的字符内容完全无关。注意纯整数
+ * 不加分隔符同样会碰撞（(1,112) 与 (11,12) 都拼成 "1112"），分隔符不能省。
+ */
+function edgeKey(i: number, j: number): string {
+  return i < j ? `${i},${j}` : `${j},${i}`;
 }
 
 export class CooccurrenceGraph {
@@ -40,7 +50,9 @@ export class CooccurrenceGraph {
     }
     this.addNode(a);
     this.addNode(b);
-    const key = edgeKey(a, b);
+    const ia = this.nodeIndex.get(a)!;
+    const ib = this.nodeIndex.get(b)!;
+    const key = edgeKey(ia, ib);
     const existing = this.edgeMap.get(key);
     if (existing) {
       existing.weight += 1;
@@ -49,8 +61,8 @@ export class CooccurrenceGraph {
       const target = a < b ? b : a;
       this.edgeMap.set(key, { source, target, weight: 1 });
     }
-    this.totalWeight[this.nodeIndex.get(a)!] += 1;
-    this.totalWeight[this.nodeIndex.get(b)!] += 1;
+    this.totalWeight[ia] += 1;
+    this.totalWeight[ib] += 1;
   }
 
   get nodeCount(): number {

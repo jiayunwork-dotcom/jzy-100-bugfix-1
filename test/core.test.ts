@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { AppError, ErrorCodes } from '../src/core/errors';
-import { buildCooccurrenceGraph } from '../src/core/graph';
+import { buildCooccurrenceGraph, type CooccurrenceGraph } from '../src/core/graph';
 import { rankNodes } from '../src/core/rank';
 import { selectTopKeywords } from '../src/core/select';
 import { inspectGraph } from '../src/services/keywordService';
@@ -221,4 +221,132 @@ test('原始文本输入：按句读切句、空白切词，过滤逻辑与预�
   const filter = new StopwordFilter(['的']);
   const tokenized = tokenizeDocument({ text: '猫 的 鱼\n狗 的 骨头' }, filter);
   assert.deepEqual(tokenized, [['猫', '鱼'], ['狗', '骨头']]);
+});
+
+// 复现夹具：上游分词粒度不稳，同一机构名在两句里被切成不同词面量。
+// 旧实现的边键直接拼接词面量（无分隔符），("中国","人民银行") 与
+// ("中国人民","银行") 塌缩成同一条边，导致少边、权重错乱、迭代发散。
+const SPLIT_ORG: string[][] = [
+  ['中国', '人民银行', '发布', '利率'],
+  ['中国人民', '银行', '发布', '公告'],
+];
+
+test('回归（边键拼接碰撞）：机构名不同切法不得塌缩边，逐对手数的 6 条边齐全且权重各为 1', () => {
+  const graph = build(SPLIT_ORG, 2);
+  assert.equal(graph.nodeCount, 7);
+  assert.equal(graph.edgeCount, 6);
+
+  const data = graph.toData();
+  assert.deepEqual(
+    data.nodes,
+    ['中国', '中国人民', '人民银行', '公告', '利率', '发布', '银行'],
+  );
+  // 窗口 2、每句 4 个词：每句各 3 条相邻共现边，两句共 6 条，无跨句重复对。
+  const expected = [
+    ['中国', '人民银行'],
+    ['中国人民', '银行'],
+    ['人民银行', '发布'],
+    ['公告', '发布'],
+    ['利率', '发布'],
+    ['发布', '银行'],
+  ];
+  assert.deepEqual(
+    data.edges.map((e) => [e.source, e.target]),
+    expected,
+  );
+  for (const edge of data.edges) {
+    assert.equal(edge.weight, 1, `边 ${edge.source}-${edge.target} 权重应为 1`);
+  }
+});
+
+test('回归：同一份夹具在默认步数内收敛，所有分数都是有限数值，同分按字典序', () => {
+  const graph = build(SPLIT_ORG, 2);
+  // 默认参数：damping 0.85、tolerance 1e-6、maxIterations 200
+  const result = rankNodes(graph, 0.85, 1e-6, 200);
+  assert.equal(result.converged, true);
+  assert.ok(result.iterations >= 1 && result.iterations <= 200);
+  assert.equal(result.scores.size, 7);
+  for (const [word, score] of result.scores) {
+    assert.ok(Number.isFinite(score), `词「${word}」的分数必须有限，实际 ${String(score)}`);
+  }
+
+  const top = selectTopKeywords(result, 50).map((k) => k.word);
+  // 发布 是跨两句的枢纽，分数最高；同分对按字典序：
+  // 人民银行<银行、中国<中国人民、公告<利率。
+  assert.deepEqual(top, ['发布', '人民银行', '银行', '中国', '中国人民', '公告', '利率']);
+});
+
+test('边键碰撞在多种“可拼接混淆”词面上都不再发生（含带空格的英文专名）', () => {
+  // 旧拼接键（排序后直接相连）下每一组的两对词都会塌缩；下标键与词面量无关，必须分开。
+  const cases: string[][][] = [
+    [['中国', '人民银行'], ['中国人民', '银行']],
+    [['a b', 'c'], ['a', 'b c']],
+    [['x-', 'yz/w'], ['x-y', 'z/w']],
+  ];
+  for (const sentences of cases) {
+    const graph = build(sentences, 2);
+    assert.equal(graph.nodeCount, 4);
+    assert.equal(graph.edgeCount, 2, `夹具 ${JSON.stringify(sentences)} 应有两条互不相同的边`);
+    const data = graph.toData();
+    for (const edge of data.edges) {
+      assert.equal(edge.weight, 1);
+    }
+    // 图结构正确 -> 两条互不相连的边构成对称图，全部稳态分数为 1 且正常收敛。
+    const result = rankNodes(graph, 0.85, 1e-6, 200);
+    assert.equal(result.converged, true);
+    for (const score of result.scores.values()) {
+      assert.ok(Number.isFinite(score));
+      assert.ok(Math.abs(score - 1) < 1e-9);
+    }
+  }
+});
+
+test('预分词中的词可含空格/连字符/斜杠等任意字符：原文共现关系照实入图', () => {
+  // 「new york」整体算一个词；与 '/x-y/' 在窗口 3 内共现两次（位置 0-1、1-2）。
+  const graph = build([['new york', '/x-y/', 'new york']], 3);
+  const data = graph.toData();
+  assert.deepEqual(data.nodes, ['/x-y/', 'new york']);
+  assert.deepEqual(
+    data.edges.map((e) => [e.source, e.target, e.weight]),
+    [['/x-y/', 'new york', 2]],
+  );
+});
+
+test('数值守卫：迭代出现 Infinity 时不得标记为收敛，直接抛 NOT_CONVERGED', () => {
+  // 构造一个真实建图 API 无法产生的病态邻接结构：节点自环权重 2、
+  // 但总出边权重只记 1，转移放大约 1.85 倍/步，分数必在约 1200 步内冲到 Infinity。
+  // 守卫必须在发散时拦下，而不是让 maxDelta 因 NaN 比较恒假而误判收敛。
+  const divergent = {
+    toAdjacency() {
+      return {
+        nodes: ['x'],
+        neighbors: [[{ index: 0, weight: 2 }]],
+        totalOutWeight: [1],
+      };
+    },
+  } as unknown as CooccurrenceGraph;
+  assert.throws(
+    () => rankNodes(divergent, 0.85, 1e-6, 5000),
+    (err: unknown) => err instanceof AppError && err.code === ErrorCodes.NOT_CONVERGED,
+  );
+});
+
+test('数值守卫：分数出现 NaN 时第一步即拒绝，绝不返回被污染的结果', () => {
+  // Infinity/Infinity = NaN，下一跳分数立刻变成 NaN。
+  const nanGraph = {
+    toAdjacency() {
+      return {
+        nodes: ['x', 'y'],
+        neighbors: [
+          [{ index: 1, weight: Infinity }],
+          [{ index: 0, weight: Infinity }],
+        ],
+        totalOutWeight: [Infinity, Infinity],
+      };
+    },
+  } as unknown as CooccurrenceGraph;
+  assert.throws(
+    () => rankNodes(nanGraph, 0.85, 1e-6, 5000),
+    (err: unknown) => err instanceof AppError && err.code === ErrorCodes.NOT_CONVERGED,
+  );
 });
