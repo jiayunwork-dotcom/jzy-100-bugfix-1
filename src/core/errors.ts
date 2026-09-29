@@ -11,6 +11,8 @@
  *  - INVALID_TOLERANCE        收敛阈值不是 > 0 的数
  *  - INVALID_MAX_ITERATIONS   迭代步数上限不是 >= 1 的整数
  *  - NOT_CONVERGED            达到迭代步数上限仍未收敛（不允许返回半成品分数）
+ *  - NON_FINITE_SCORE         迭代中出现 NaN 或 ±Infinity（数值已经坏掉，
+ *                             即使 delta 比较“碰巧”很小，也绝不允许标记为收敛）
  */
 export const ErrorCodes = {
   INVALID_REQUEST: 'INVALID_REQUEST',
@@ -22,6 +24,7 @@ export const ErrorCodes = {
   INVALID_TOLERANCE: 'INVALID_TOLERANCE',
   INVALID_MAX_ITERATIONS: 'INVALID_MAX_ITERATIONS',
   NOT_CONVERGED: 'NOT_CONVERGED',
+  NON_FINITE_SCORE: 'NON_FINITE_SCORE',
 } as const;
 
 export type ErrorCode = (typeof ErrorCodes)[keyof typeof ErrorCodes];
@@ -37,6 +40,7 @@ const STATUS_BY_CODE: Record<ErrorCode, number> = {
   INVALID_TOLERANCE: 400,
   INVALID_MAX_ITERATIONS: 400,
   NOT_CONVERGED: 422,
+  NON_FINITE_SCORE: 422,
 };
 
 export class AppError extends Error {

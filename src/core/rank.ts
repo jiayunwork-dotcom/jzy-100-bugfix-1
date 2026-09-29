@@ -16,6 +16,11 @@
  *   初始分数全部为 1。每轮取所有词新旧分数差的最大绝对值，
  *   当该值 < 收敛阈值时判定收敛；达到步数上限仍未收敛则抛 NOT_CONVERGED，
  *   绝不把未稳定的半成品分数当正常结果返回。
+ *
+ *   数值安全底线：任何一轮只要出现 NaN 或 ±Infinity（无论分数本身还是收敛
+ *   差值），立即抛 NON_FINITE_SCORE。NaN 与任何数比较都为 false，若不加这道
+ *   防线，坏掉的分数会让 maxDelta 停在一个小值上、被误判为“已收敛”，再经
+ *   JSON 序列化成 null 流向下游 —— 这比显式报错危险得多。
  */
 import { AppError, ErrorCodes } from './errors';
 import type { CooccurrenceGraph } from './graph';
@@ -52,7 +57,21 @@ export function rankNodes(
         inbound += (weight / totalOutWeight[j]) * scores[j];
       }
       next[i] = 1 - damping + damping * inbound;
+      // 数值底线：分数一旦变成 NaN/±Infinity，本轮立即终止并报错，
+      // 不让它参与 delta 比较（NaN 的比较结果恒为 false，会伪装成收敛）。
+      if (!Number.isFinite(next[i])) {
+        throw new AppError(
+          ErrorCodes.NON_FINITE_SCORE,
+          `第 ${iter} 轮迭代后节点「${nodes[i]}」的分数不是有限数值（${String(next[i])}），图结构或中间数值已损坏，拒绝返回结果`,
+        );
+      }
       const delta = Math.abs(next[i] - scores[i]);
+      if (!Number.isFinite(delta)) {
+        throw new AppError(
+          ErrorCodes.NON_FINITE_SCORE,
+          `第 ${iter} 轮迭代的收敛差值不是有限数值（${String(delta)}），拒绝在数值损坏的情况下判定收敛`,
+        );
+      }
       if (delta > maxDelta) {
         maxDelta = delta;
       }
@@ -72,8 +91,15 @@ export function rankNodes(
     );
   }
 
+  // 出口处再兜底一次：任何非有限分数都不得作为“已收敛”结果离开本模块。
   const scoreMap = new Map<string, number>();
   for (let i = 0; i < n; i += 1) {
+    if (!Number.isFinite(scores[i])) {
+      throw new AppError(
+        ErrorCodes.NON_FINITE_SCORE,
+        `节点「${nodes[i]}」的最终分数不是有限数值（${String(scores[i])}），拒绝把损坏结果标记为收敛`,
+      );
+    }
     scoreMap.set(nodes[i], scores[i]);
   }
   return { scores: scoreMap, converged, iterations };

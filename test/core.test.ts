@@ -222,3 +222,202 @@ test('原始文本输入：按句读切句、空白切词，过滤逻辑与预�
   const tokenized = tokenizeDocument({ text: '猫 的 鱼\n狗 的 骨头' }, filter);
   assert.deepEqual(tokenized, [['猫', '鱼'], ['狗', '骨头']]);
 });
+
+// ---------------------------------------------------------------------------
+// 回归：上游分词粒度不稳导致“一个词是另一个词前缀”时，旧版边键（无分隔符
+// 拼接词字符串）会把两条不同的边塌缩成一条，进而使迭代发散 / 假收敛。
+// ---------------------------------------------------------------------------
+
+/**
+ * 无歧义的“无序词对”键：JSON 序列化两个端点，端点按字典序排列。
+ * 用 JSON 而非字符串拼接，是因为本批回归夹具的词元本身可能包含任意字符
+ * （空格、连字符、斜杠……），拼接键会重蹈“前缀塌缩”的覆辙；JSON 对引号、
+ * 反斜杠与控制字符都有转义，保证不同词对不可能映射到同一个键。
+ */
+function pairKey(a: string, b: string): string {
+  return JSON.stringify(a < b ? [a, b] : [b, a]);
+}
+
+/** 逐对手数 windowSize=2 的共现：句内相邻位置两两成对，每出现一次权重 +1。 */
+function expectedBigrams(sentences: readonly string[][]): Map<string, number> {
+  const expected = new Map<string, number>();
+  for (const sentence of sentences) {
+    for (let i = 0; i + 1 < sentence.length; i += 1) {
+      const [a, b] = [sentence[i], sentence[i + 1]];
+      if (a === b) continue; // 图不连自环
+      const key = pairKey(a, b);
+      expected.set(key, (expected.get(key) ?? 0) + 1);
+    }
+  }
+  return expected;
+}
+
+/** 把图导出的边收集成 “无歧义词对键 -> 权重”。 */
+function edgeWeightMap(graph: ReturnType<typeof build>): Map<string, number> {
+  return new Map(graph.toData().edges.map((e) => [pairKey(e.source, e.target), e.weight]));
+}
+
+test('回归（线上复现稿）：前缀词元不再塌缩边，图与逐对手数完全一致', () => {
+  const sentences: string[][] = [
+    ['中国', '人民银行', '发布', '利率'],
+    ['中国人民', '银行', '发布', '公告'],
+  ];
+  const graph = build(sentences, 2);
+
+  // 7 个词元互不为同一节点；逐对手数的相邻共现对恰好 6 对。
+  assert.equal(graph.nodeCount, 7);
+  assert.equal(graph.edgeCount, 6, '旧实现会把 (中国,人民银行) 与 (中国人民,银行) 塌成一条，只剩 5 条');
+
+  const byPair = edgeWeightMap(graph);
+  const expected = expectedBigrams(sentences);
+  assert.equal(byPair.size, expected.size);
+  for (const [key, weight] of expected) {
+    assert.equal(byPair.get(key), weight, `边 ${key} 的权重与逐对手数不一致`);
+  }
+
+  // 默认步数（200）内收敛，所有分数都是有限数值。
+  const result = rankNodes(graph, 0.85, 1e-6, 200);
+  assert.equal(result.converged, true);
+  assert.ok(result.iterations <= 200);
+  assert.equal(result.scores.size, 7);
+  for (const [word, score] of result.scores) {
+    assert.ok(Number.isFinite(score), `词「${word}」的分数必须有限，实际为 ${String(score)}`);
+  }
+
+  // 排序：分数降序，同分按字典序。
+  // 图关于 (人民银行↔银行)、(中国↔中国人民)、(利率↔公告) 对称，分数应两两相等。
+  const ranked = selectTopKeywords(result, 10);
+  assert.equal(ranked.length, 7);
+  for (let i = 1; i < ranked.length; i += 1) {
+    const prev = ranked[i - 1];
+    const cur = ranked[i];
+    assert.ok(
+      prev.score > cur.score || (prev.score === cur.score && prev.word < cur.word),
+      `排序规则被破坏：${prev.word}(${prev.score}) 不应排在 ${cur.word}(${cur.score}) 前`,
+    );
+  }
+});
+
+test('回归（ASCII 同构夹具）：词元互为前缀时边不塌缩', () => {
+  // 与中文复现稿同构的碰撞模式：("ab","cde") 与 ("abc","de") 的旧拼接键同为 "abcde"。
+  const sentences: string[][] = [
+    ['ab', 'cde', 'f', 'g'],
+    ['abc', 'de', 'f', 'h'],
+  ];
+  const graph = build(sentences, 2);
+  assert.equal(graph.nodeCount, 7);
+  assert.equal(graph.edgeCount, 6);
+
+  const byPair = edgeWeightMap(graph);
+  for (const [key, weight] of expectedBigrams(sentences)) {
+    assert.equal(byPair.get(key), weight, `边 ${key} 权重不符`);
+  }
+
+  const result = rankNodes(graph, 0.85, 1e-6, 200);
+  assert.equal(result.converged, true);
+  for (const score of result.scores.values()) {
+    assert.ok(Number.isFinite(score));
+  }
+});
+
+test('边键健壮性：词元含空格 / 连字符 / 斜杠等任意字符，图照实反映共现', () => {
+  const sentences: string[][] = [
+    ['new york', '沪深300', 'a/b'],
+    ['new york', '沪深300', 'x-y z'],
+  ];
+  const graph = build(sentences, 3);
+
+  // 整串「new york」是一个节点，不被空白拆开。
+  assert.deepEqual(graph.toData().nodes, ['a/b', 'new york', 'x-y z', '沪深300']);
+
+  const byPair = edgeWeightMap(graph);
+  // windowSize=3：
+  // 句1: (a/b,new york)、(a/b,沪深300)、(new york,沪深300)
+  // 句2: (new york,x-y z)、(new york,沪深300)、(x-y z,沪深300)
+  assert.equal(graph.edgeCount, 5);
+  assert.equal(byPair.get(pairKey('a/b', 'new york')), 1);
+  assert.equal(byPair.get(pairKey('a/b', '沪深300')), 1);
+  assert.equal(byPair.get(pairKey('new york', '沪深300')), 2, '跨两句共现，权重累加为 2');
+  assert.equal(byPair.get(pairKey('new york', 'x-y z')), 1);
+  assert.equal(byPair.get(pairKey('x-y z', '沪深300')), 1);
+
+  const result = rankNodes(graph, 0.85, 1e-6, 200);
+  assert.equal(result.converged, true);
+  assert.ok(result.scores.has('new york'));
+  for (const score of result.scores.values()) {
+    assert.ok(Number.isFinite(score));
+  }
+});
+
+test('数值底线：迭代中出现 NaN/Infinity 必须报 NON_FINITE_SCORE，绝不假收敛', () => {
+  // 复刻修复前建图实现（无分隔符词串拼接边键）在复现稿上产出的坏图：
+  // 两条不同边塌缩后，totalOutWeight 与边权记账不一致，转移比例列和失衡，
+  // 分数发散成 Infinity；旧打分逻辑在 Infinity-Infinity=NaN 时 delta 比较
+  // 恒为 false，反而把 maxDelta 卡小、误判收敛，Infinity 经 JSON 变成 null。
+  class LegacyBuggyGraph {
+    private readonly nodeIndex = new Map<string, number>();
+    private readonly edgeMap = new Map<string, { source: string; target: string; weight: number }>();
+    private readonly totalWeight: number[] = [];
+    addNode(word: string): void {
+      if (!this.nodeIndex.has(word)) {
+        this.nodeIndex.set(word, this.nodeIndex.size);
+        this.totalWeight.push(0);
+      }
+    }
+    addEdge(a: string, b: string): void {
+      if (a === b) return;
+      this.addNode(a);
+      this.addNode(b);
+      const key = a < b ? `${a}${b}` : `${b}${a}`; // 旧的无分隔符拼接（缺陷点）
+      const existing = this.edgeMap.get(key);
+      if (existing) {
+        existing.weight += 1;
+      } else {
+        this.edgeMap.set(key, { source: a < b ? a : b, target: a < b ? b : a, weight: 1 });
+      }
+      this.totalWeight[this.nodeIndex.get(a)!] += 1;
+      this.totalWeight[this.nodeIndex.get(b)!] += 1;
+    }
+    toAdjacency() {
+      const nodes: string[] = new Array(this.nodeIndex.size);
+      for (const [word, idx] of this.nodeIndex) nodes[idx] = word;
+      const neighbors = nodes.map(() => [] as { index: number; weight: number }[]);
+      for (const edge of this.edgeMap.values()) {
+        const i = this.nodeIndex.get(edge.source)!;
+        const j = this.nodeIndex.get(edge.target)!;
+        neighbors[i].push({ index: j, weight: edge.weight });
+        neighbors[j].push({ index: i, weight: edge.weight });
+      }
+      return { nodes, neighbors, totalOutWeight: [...this.totalWeight] };
+    }
+  }
+  const legacy: any = new LegacyBuggyGraph();
+  for (const t of ['中国', '人民银行', '发布', '利率']) legacy.addNode(t);
+  for (const [a, b] of [['中国', '人民银行'], ['人民银行', '发布'], ['发布', '利率']]) legacy.addEdge(a, b);
+  for (const t of ['中国人民', '银行', '公告']) legacy.addNode(t);
+  for (const [a, b] of [['中国人民', '银行'], ['银行', '发布'], ['发布', '公告']]) legacy.addEdge(a, b);
+
+  // 步数给得很宽裕：旧逻辑恰好在这种设置下“假收敛 + null 分数”；
+  // 新逻辑必须在数值溢出的那一轮直接报错，任何时候都不返回坏分数。
+  assert.throws(
+    () => rankNodes(legacy, 0.85, 1e-6, 5000),
+    (err: unknown) => err instanceof AppError && err.code === ErrorCodes.NON_FINITE_SCORE,
+  );
+
+  // 人为构造“总出权为 NaN 且节点真有邻居”的坏邻接：weight/NaN = NaN，
+  // 新分数立刻变成 NaN，必须当轮报错，而不是靠 delta 比较蒙混过关。
+  const poisoned: any = {
+    toAdjacency: () => ({
+      nodes: ['p', 'q'],
+      neighbors: [
+        [{ index: 1, weight: 1 }],
+        [{ index: 0, weight: 1 }],
+      ],
+      totalOutWeight: [NaN, NaN],
+    }),
+  };
+  assert.throws(
+    () => rankNodes(poisoned, 0.85, 1e-6, 10),
+    (err: unknown) => err instanceof AppError && err.code === ErrorCodes.NON_FINITE_SCORE,
+  );
+});

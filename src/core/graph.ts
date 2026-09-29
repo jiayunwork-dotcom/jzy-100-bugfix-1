@@ -14,16 +14,37 @@
  */
 import type { CooccurrenceGraphData, GraphEdge, TokenSequence } from './types';
 
-/** 规范化无向边键：端点按字典序排列，保证 (a,b) 与 (b,a) 是同一条边。 */
-function edgeKey(a: string, b: string): string {
-  return a < b ? `${a}${b}` : `${b}${a}`;
+interface EdgeRecord {
+  source: string;
+  target: string;
+  weight: number;
+}
+
+/**
+ * 边键分隔符。边键基于【节点下标】构建（见 edgeKeyByIndex），下标只可能由十进制
+ * 数字组成，因此任何非数字字符都不会与下标内容冲突。预分词词元可以包含任意
+ * Unicode 字符（空格、连字符、斜杠等），也完全不参与边键，杜绝碰撞面。
+ */
+const EDGE_KEY_SEP = '#';
+
+/**
+ * 规范化无向边键：端点按节点下标升序排列，保证 (i,j) 与 (j,i) 是同一条边。
+ *
+ * 绝不能把两个【词字符串】直接拼接当键：当一个词恰好是另一个词的前缀时
+ * （如 "中国"+"人民银行" 与 "中国人民"+"银行" 都拼成 "中国人民银行"），
+ * 两条本不相同的边会塌缩成同一条 —— 边数少一条、边权错累加，而各节点的
+ * 总出边权重仍按两条边各计一次，迭代时转移比例列和不再为 1，分数会发散
+ * 成 Infinity/NaN。下标键从根上消除这一类歧义。
+ */
+function edgeKeyByIndex(i: number, j: number): string {
+  return i < j ? `${i}${EDGE_KEY_SEP}${j}` : `${j}${EDGE_KEY_SEP}${i}`;
 }
 
 export class CooccurrenceGraph {
   /** 词 -> 节点下标 */
   private readonly nodeIndex = new Map<string, number>();
   /** 规范化边键 -> 边（权重累加） */
-  private readonly edgeMap = new Map<string, { source: string; target: string; weight: number }>();
+  private readonly edgeMap = new Map<string, EdgeRecord>();
   /** 节点下标 -> 总出边权重（无向图：与该节点相连的所有边权之和） */
   private totalWeight: number[] = [];
 
@@ -40,17 +61,20 @@ export class CooccurrenceGraph {
     }
     this.addNode(a);
     this.addNode(b);
-    const key = edgeKey(a, b);
+    const ia = this.nodeIndex.get(a)!;
+    const ib = this.nodeIndex.get(b)!;
+    const key = edgeKeyByIndex(ia, ib);
     const existing = this.edgeMap.get(key);
     if (existing) {
       existing.weight += 1;
     } else {
+      // source/target 仍按词的字典序规范化，输出形态与历史格式保持一致。
       const source = a < b ? a : b;
       const target = a < b ? b : a;
       this.edgeMap.set(key, { source, target, weight: 1 });
     }
-    this.totalWeight[this.nodeIndex.get(a)!] += 1;
-    this.totalWeight[this.nodeIndex.get(b)!] += 1;
+    this.totalWeight[ia] += 1;
+    this.totalWeight[ib] += 1;
   }
 
   get nodeCount(): number {

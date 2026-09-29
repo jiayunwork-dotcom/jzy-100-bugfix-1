@@ -193,3 +193,151 @@ test('原始文本输入走完整接口链路', async () => {
   assert.equal(res.statusCode, 200);
   assert.equal(res.json().keywords.length, 3);
 });
+
+// ---------------------------------------------------------------------------
+// 线上复现：同一机构名在两句里分词粒度不一致（前缀词元导致旧边键塌缩）。
+// ---------------------------------------------------------------------------
+
+const REPRO_BODY = {
+  document: {
+    sentences: [
+      ['中国', '人民银行', '发布', '利率'],
+      ['中国人民', '银行', '发布', '公告'],
+    ],
+  },
+  windowSize: 2,
+};
+
+test('复现稿 POST /v1/keywords：默认步数内收敛，7 个词全部得到有限分数', async () => {
+  const res = await post('/v1/keywords', REPRO_BODY);
+  assert.equal(res.statusCode, 200, `body=${res.body}`);
+  const body = res.json();
+  assert.equal(body.nodeCount, 7);
+  assert.equal(body.edgeCount, 6);
+  assert.equal(body.converged, true);
+  assert.ok(body.iterations <= 200, '默认 maxIterations=200 内必须收敛');
+  assert.equal(body.keywords.length, 7);
+
+  // 排序规则：分数降序，同分按词字典序升序。
+  for (let i = 1; i < body.keywords.length; i += 1) {
+    const prev = body.keywords[i - 1];
+    const cur = body.keywords[i];
+    assert.ok(
+      prev.score > cur.score || (prev.score === cur.score && prev.word < cur.word),
+      `排序规则被破坏：${prev.word} 不应排在 ${cur.word} 前`,
+    );
+    // 关键回归点：score 绝不允许是 null（Infinity 经 JSON 序列化的结果）。
+    assert.ok(typeof cur.score === 'number' && Number.isFinite(cur.score), `${cur.word} 分数非有限值`);
+  }
+  assert.ok(typeof body.keywords[0].score === 'number' && Number.isFinite(body.keywords[0].score));
+
+  // 枢纽词「发布」与两句共现，分数最高；两个叶子对称对同分且按字典序排列。
+  assert.equal(body.keywords[0].word, '发布');
+});
+
+test('复现稿 POST /v1/graph：每条边与逐对手数一致，边权不再错累加', async () => {
+  const res = await post('/v1/graph', REPRO_BODY);
+  assert.equal(res.statusCode, 200, `body=${res.body}`);
+  const body = res.json();
+  assert.deepEqual(body.graph.nodes, ['中国', '中国人民', '人民银行', '公告', '利率', '发布', '银行']);
+
+  // windowSize=2 只连句内相邻对，逐对手数恰好 6 对，每对权重均为 1：
+  // 句1: (中国,人民银行)、(人民银行,发布)、(发布,利率)
+  // 句2: (中国人民,银行)、(银行,发布)、(发布,公告)
+  const pairKey = (a: string, b: string) => JSON.stringify(a < b ? [a, b] : [b, a]);
+  const weights = new Map(body.graph.edges.map((e: { source: string; target: string; weight: number }) => [pairKey(e.source, e.target), e.weight]));
+  assert.equal(body.graph.edges.length, 6);
+  for (const pair of [
+    ['中国', '人民银行'],
+    ['人民银行', '发布'],
+    ['发布', '利率'],
+    ['中国人民', '银行'],
+    ['银行', '发布'],
+    ['发布', '公告'],
+  ]) {
+    assert.equal(weights.get(pairKey(pair[0], pair[1])), 1, `边 ${pair[0]}-${pair[1]} 缺失或权重错误`);
+  }
+  assert.equal(body.nodeCount, 7);
+  assert.equal(body.edgeCount, 6);
+});
+
+test('预分词词元可含空格/连字符/斜杠等任意字符：整体算一个词，共现照实反映', async () => {
+  const res = await post('/v1/keywords', {
+    document: {
+      sentences: [
+        ['new york', '沪深300', 'a/b'],
+        ['new york', '沪深300', 'x-y z'],
+      ],
+    },
+    windowSize: 3,
+  });
+  assert.equal(res.statusCode, 200, `body=${res.body}`);
+  const body = res.json();
+  assert.equal(body.nodeCount, 4);
+  assert.equal(body.edgeCount, 5);
+  assert.equal(body.converged, true);
+  const words = body.keywords.map((k: { word: string }) => k.word);
+  assert.ok(words.includes('new york'), '含空格的英文专名必须整体作为一个词');
+  assert.ok(words.includes('x-y z'));
+  for (const k of body.keywords) {
+    assert.ok(typeof k.score === 'number' && Number.isFinite(k.score));
+  }
+
+  // 建图接口同样把整串当一个节点
+  const gres = await post('/v1/graph', {
+    document: { sentences: [['new york', '沪深300', 'a/b']] },
+    windowSize: 2,
+  });
+  assert.deepEqual(gres.json().graph.nodes, ['a/b', 'new york', '沪深300']);
+});
+
+test('批量中混进复现稿：它自己出正确结果，同批其它篇不受影响', async () => {
+  const normalDoc = { document: { sentences: [['a', 'b', 'a', 'b']] }, windowSize: 2 };
+  const badParamsDoc = { document: { sentences: [['a', 'b']] }, damping: 1 };
+  const res = await post('/v1/keywords/batch', {
+    documents: [normalDoc, REPRO_BODY, badParamsDoc],
+  });
+  assert.equal(res.statusCode, 200);
+  const { results } = res.json();
+  assert.equal(results.length, 3);
+
+  // 同批的正常篇结果不变（a/b 对称图，分数都为 1）。
+  assert.equal(results[0].ok, true);
+  assert.deepEqual(
+    results[0].result.keywords.map((k: { word: string }) => k.word),
+    ['a', 'b'],
+  );
+  for (const k of results[0].result.keywords) {
+    assert.ok(Math.abs(k.score - 1) < 1e-9);
+  }
+
+  // 复现稿在批量项内独立收敛出完整结果。
+  assert.equal(results[1].ok, true, JSON.stringify(results[1]));
+  assert.equal(results[1].result.nodeCount, 7);
+  assert.equal(results[1].result.edgeCount, 6);
+  assert.equal(results[1].result.converged, true);
+  assert.equal(results[1].result.keywords.length, 7);
+  for (const k of results[1].result.keywords) {
+    assert.ok(typeof k.score === 'number' && Number.isFinite(k.score));
+  }
+
+  // 同批的参数错误篇仍只在自己这一项报错。
+  assert.equal(results[2].ok, false);
+  assert.equal(results[2].error.code, 'INVALID_DAMPING');
+});
+
+test('批量建图中混进复现稿同样逐篇独立', async () => {
+  const res = await post('/v1/graph/batch', {
+    documents: [
+      { document: { sentences: [['x', 'y']] } },
+      REPRO_BODY,
+    ],
+  });
+  assert.equal(res.statusCode, 200);
+  const { results } = res.json();
+  assert.equal(results[0].ok, true);
+  assert.equal(results[0].result.edgeCount, 1);
+  assert.equal(results[1].ok, true, JSON.stringify(results[1]));
+  assert.equal(results[1].result.nodeCount, 7);
+  assert.equal(results[1].result.edgeCount, 6);
+});
